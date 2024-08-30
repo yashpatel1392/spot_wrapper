@@ -11,7 +11,6 @@ from bosdyn.api import (
     synchronized_command_pb2,
     trajectory_pb2,
 )
-from bosdyn.api.robot_state_pb2 import ManipulatorState
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot import Robot
 from bosdyn.client.robot_command import (
@@ -73,6 +72,7 @@ class SpotArm:
                 self.gripper_angle_open,
                 self.hand_pose,
                 self.grasp_3d,
+                self.get_arm_joint_values,
             ],
         )
 
@@ -219,6 +219,44 @@ class SpotArm:
             return False, f"Exception occured while carry mode was issued: {e}"
 
         return True, "Carry mode success"
+
+    # NEWER DEFINITION SERVICE #2
+    def parse_arm_joints_data(self, data):
+        splitted_data = data.strip().split('\n')
+        counter = 0
+        joint_values = []
+        
+        for i in range(len(splitted_data)):
+            if counter >= 6: # no need to iterate the list after all 6 joint values have been recorded
+                break
+            
+            if splitted_data[i].strip().startswith('joint_states'):
+                if (i+3 < len(splitted_data)):
+                    joint_name = splitted_data[i+1].strip().split(':')[1].strip().replace('"', '')
+
+                    if joint_name == 'arm0.hr0' or joint_name == 'arm0.f1x':
+                        continue
+                    
+                    if joint_name.startswith('arm'):
+                        arm_joint_position = float(splitted_data[i+3].strip().split(':')[1].strip())
+                        
+                        # arm_joint_name = joint_name.split('.')[1]
+                        # print(counter, arm_joint_name, ": ", arm_joint_position)
+                        
+                        joint_values.append(arm_joint_position)
+                        
+                        counter += 1
+                    
+        # returns a dict where key is the joint name while the values are the corresponding values
+        return joint_values
+
+    def get_arm_joint_values(self) -> typing.Tuple[bool, str, typing.List[float]]:
+        joint_values = []
+        
+        state_data = self._robot_state_client.get_robot_state()
+        joint_values = self.parse_arm_joints_data(str(state_data))
+
+        return True, "getting arm joint values success", joint_values
 
     def make_arm_trajectory_command(
         self, arm_joint_trajectory: arm_command_pb2.ArmJointTrajectory
@@ -418,7 +456,12 @@ class SpotArm:
                 self._logger.info(msg)
                 return False, msg
             else:
-                command = RobotCommandBuilder.claw_gripper_open_fraction_command(gripper_ang / 90.0)
+                # The open angle command does not take degrees but the limits
+                # defined in the urdf, that is why we have to interpolate
+                closed = 0.349066
+                opened = -1.396263
+                angle = gripper_ang / 90.0 * (opened - closed) + closed
+                command = RobotCommandBuilder.claw_gripper_open_angle_command(angle)
 
                 # Command issue with RobotCommandClient
                 cmd_id = self._robot_command_client.robot_command(command)
@@ -494,50 +537,6 @@ class SpotArm:
                 f"An error occured while trying to move arm \n Exception: {e}",
             )
 
-        return True, "Moved arm successfully"
-
-    def handle_arm_velocity(
-        self, arm_velocity_command: arm_command_pb2.ArmVelocityCommand.Request, cmd_duration: float = 0.15
-    ) -> typing.Tuple[bool, str]:
-        """
-        Set the velocity of the arm TCP
-
-        Args:
-            arm_velocity_command: Protobuf message to set the arm velocity
-            cmd_duration: (optional) Time-to-live for the command in seconds.
-
-        Returns:
-            Boolean success, string message
-        """
-
-        try:
-            success, msg = self.ensure_arm_power_and_stand()
-            if not success:
-                self._logger.info(msg)
-                return False, msg
-            else:
-                end_time = self._robot.time_sync.robot_timestamp_from_local_secs(time.time() + cmd_duration)
-
-                arm_velocity_command2 = arm_command_pb2.ArmVelocityCommand.Request(
-                    cylindrical_velocity=arm_velocity_command.cylindrical_velocity,
-                    angular_velocity_of_hand_rt_odom_in_hand=arm_velocity_command.angular_velocity_of_hand_rt_odom_in_hand,
-                    cartesian_velocity=arm_velocity_command.cartesian_velocity,
-                    maximum_acceleration=arm_velocity_command.maximum_acceleration,
-                    end_time=end_time,
-                )
-
-                robot_command = robot_command_pb2.RobotCommand()
-                robot_command.synchronized_command.arm_command.arm_velocity_command.CopyFrom(arm_velocity_command2)
-
-                self._robot_command_client.robot_command(
-                    command=robot_command, end_time_secs=time.time() + cmd_duration
-                )
-
-        except Exception as e:
-            return (
-                False,
-                f"An error occured while trying to move arm\n Exception: {e}",
-            )
         return True, "Moved arm successfully"
 
     @staticmethod
@@ -657,52 +656,3 @@ class SpotArm:
                 return False, msg
         except Exception as e:
             return False, f"An error occured while trying to grasp from pose {e}"
-
-    def override_grasp_or_carry(
-        self,
-        grasp_override: manipulation_api_pb2.ApiGraspOverride.Override,
-        carry_override: ManipulatorState.CarryState,
-    ) -> typing.Tuple[bool, str]:
-        """
-        Override the robot's grasp and/or carry state.
-
-        Grasp Override:
-
-        The robot's grasp state is whether or not it's holding an object.  Usually the robot is aware of whether or not
-        it is grasping something but sometimes (e.g. when the object is small and the gripper is almost closed) it makes
-        mistakes.  Grasp override values:
-            OVERRIDE_UNKNOWN: If this is set, this function will not request that the grasp state be changed.
-            OVERRIDE_HOLDING: Grasp state will be changed to HOLDING
-            OVERRIDE_NOT_HOLDING: Grasp state will be changed to NOT HOLDING
-
-        Carry Override:
-
-        The robot's carry state governs what the robot will do when control of the arm is requested to stow (usually by
-        a hijack). This only matters if the grasp state is HOLDING (otherwise the arm will always stow) but this
-        function will send the request without checking the grasp state and will not alter the grasp state unless
-        requested to do so.  Carry override values:
-            CARRY_STATE_UNKNOWN: If this is set, this function will not request that the carry state be changed.
-            CARRY_STATE_NOT_CARRYABLE: When the arm is requested to stow, it will open the gripper (let go) first.
-            CARRY_STATE_CARRIABLE: When the arm is requested to stow, it will not do anything.
-            CARRY_STATE_CARRIABLE_AND_STOWABLE: When the arm is requested to stow, it will stow without attempting to
-                first release the object.
-        """
-        grasp_override_set = grasp_override != manipulation_api_pb2.ApiGraspOverride.Override.OVERRIDE_UNKNOWN
-        carry_override_set = carry_override != ManipulatorState.CarryState.CARRY_STATE_UNKNOWN
-        if not grasp_override_set and not carry_override_set:
-            return True, "No change requested"
-        request = manipulation_api_pb2.ApiGraspOverrideRequest()
-        if grasp_override_set:
-            request.api_grasp_override.override_request = grasp_override
-        if carry_override_set:
-            request.carry_state_override.override_request = carry_override
-        # This blocks by default since it's a single command
-        try:
-            self._manipulation_api_client.grasp_override_command(request)
-            if grasp_override_set and not carry_override_set:
-                return True, "Successfully overrode grasp state"
-            if not grasp_override_set:
-                return True, "Successfully overrode carry state"
-            return True, "Successfully overrode grasp and carry state"
-        except Exception as e:
-            return False, f"An error occurred while trying to override grasp or carry state: {e}"

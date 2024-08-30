@@ -49,13 +49,12 @@ from bosdyn.client.map_processing import MapProcessingServiceClient
 from bosdyn.client.payload_registration import PayloadNotAuthorizedError
 from bosdyn.client.power import PowerClient, power_on, safe_power_off
 from bosdyn.client.robot import Robot, UnregisteredServiceError
-from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_sit
+from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.spot_check import SpotCheckClient
 from bosdyn.client.time_sync import TimeSyncEndpoint
 from bosdyn.client.world_object import WorldObjectClient
 from bosdyn.geometry import EulerZXY
-from bosdyn.mission.client import MissionClient
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from .spot_arm import SpotArm
@@ -65,9 +64,10 @@ from .spot_docking import SpotDocking
 from .spot_eap import SpotEAP
 from .spot_graph_nav import SpotGraphNav
 from .spot_images import SpotImages
-from .spot_mission_wrapper import SpotMission
 from .spot_world_objects import SpotWorldObjects
 from .wrapper_helpers import ClaimAndPowerDecorator, RobotCommandData, RobotState
+from PIL import Image
+import io
 
 SPOT_CLIENT_NAME = "ros_spot"
 MAX_COMMAND_DURATION = 1e5
@@ -206,47 +206,32 @@ class AsyncIdle(AsyncPeriodicQuery):
         if self._spot_wrapper.last_stand_command is not None:
             try:
                 response = self._client.robot_command_feedback(self._spot_wrapper.last_stand_command)
-                command_feedback = response.feedback.synchronized_feedback.mobility_command_feedback
-                if command_feedback.status == basic_command_pb2.RobotCommandFeedbackStatus.STATUS_PROCESSING:
-                    self._spot_wrapper.is_sitting = False
-                    stand_status = command_feedback.stand_feedback.status
-                    if stand_status == basic_command_pb2.StandCommand.Feedback.STATUS_IS_STANDING:
-                        self._spot_wrapper.is_standing = True
-                        self._spot_wrapper.last_stand_command = None
-                    elif stand_status == basic_command_pb2.StandCommand.Feedback.STATUS_IN_PROGRESS:
-                        self._spot_wrapper.is_standing = False
-                    else:
-                        self._logger.warning("Stand command in unknown state")
-                        self._spot_wrapper.is_standing = False
-                else:
-                    self._logger.warning(
-                        f"Stand command is not being processed anymore, current status: {command_feedback.status}"
-                    )
+                status = response.feedback.synchronized_feedback.mobility_command_feedback.stand_feedback.status
+                self._spot_wrapper.is_sitting = False
+                if status == basic_command_pb2.StandCommand.Feedback.STATUS_IS_STANDING:
+                    self._spot_wrapper.is_standing = True
                     self._spot_wrapper.last_stand_command = None
+                elif status == basic_command_pb2.StandCommand.Feedback.STATUS_IN_PROGRESS:
+                    self._spot_wrapper.is_standing = False
+                else:
+                    self._logger.warning("Stand command in unknown state")
+                    self._spot_wrapper.is_standing = False
             except (ResponseError, RpcError) as e:
                 self._logger.error("Error when getting robot command feedback: %s", e)
                 self._spot_wrapper.last_stand_command = None
 
         if self._spot_wrapper.last_sit_command is not None:
             try:
+                self._spot_wrapper.is_standing = False
                 response = self._client.robot_command_feedback(self._spot_wrapper.last_sit_command)
-                command_feedback = response.feedback.synchronized_feedback.mobility_command_feedback
-                if command_feedback.status == basic_command_pb2.RobotCommandFeedbackStatus.STATUS_PROCESSING:
-                    self._spot_wrapper.is_standing = False
-                    sit_status = command_feedback.sit_feedback.status
-                    if sit_status == basic_command_pb2.SitCommand.Feedback.STATUS_IS_SITTING:
-                        self._spot_wrapper.is_sitting = True
-                        self._spot_wrapper.last_sit_command = None
-                    elif sit_status == basic_command_pb2.SitCommand.Feedback.STATUS_IN_PROGRESS:
-                        self._spot_wrapper.is_sitting = False
-                    else:
-                        self._logger.warning("Sit command in unknown state")
-                        self._spot_wrapper.is_sitting = False
-                else:
-                    self._logger.warning(
-                        f"Sit command is not being processed anymore, current status: {command_feedback.status}"
-                    )
+                if (
+                    response.feedback.synchronized_feedback.mobility_command_feedback.sit_feedback.status
+                    == basic_command_pb2.SitCommand.Feedback.STATUS_IS_SITTING
+                ):
+                    self._spot_wrapper.is_sitting = True
                     self._spot_wrapper.last_sit_command = None
+                else:
+                    self._spot_wrapper.is_sitting = False
             except (ResponseError, RpcError) as e:
                 self._logger.error("Error when getting robot command feedback: %s", e)
                 self._spot_wrapper.last_sit_command = None
@@ -293,13 +278,6 @@ class AsyncIdle(AsyncPeriodicQuery):
                 self._spot_wrapper.last_trajectory_command = None
 
         self._spot_wrapper.is_moving = is_moving
-
-        # Check if the robot is currently not receiving any velocity/trajectory commands as these will override any
-        # previous sit/stand commands, and might leave the robot in an illogical state (sitting and moving at the
-        # same time).
-        if self._spot_wrapper.is_moving:
-            self._spot_wrapper.is_standing = True
-            self._spot_wrapper.is_sitting = False
 
         # We must check if any command currently has a non-None value for its id. If we don't do this, this stand
         # command can cause other commands to be interrupted before they get to start
@@ -365,7 +343,6 @@ class SpotWrapper:
         rgb_cameras: bool = True,
         payload_credentials_file: str = None,
         cert_resource_glob: typing.Optional[str] = None,
-        gripperless: bool = False,
     ) -> None:
         """
         Args:
@@ -410,7 +387,6 @@ class SpotWrapper:
         self._keep_alive = True
         self._lease_keepalive = None
         self._valid = True
-        self.gripperless = gripperless
 
         self._mobility_params = RobotCommandBuilder.mobility_params()
         self._state = RobotState()
@@ -418,9 +394,7 @@ class SpotWrapper:
         self._command_data = RobotCommandData()
 
         try:
-            self._sdk = create_standard_sdk(
-                SPOT_CLIENT_NAME, service_clients=[MissionClient], cert_resource_glob=cert_resource_glob
-            )
+            self._sdk = create_standard_sdk(SPOT_CLIENT_NAME, cert_resource_glob=cert_resource_glob)
         except Exception as e:
             self._logger.error("Error creating SDK object: %s", e)
             self._valid = False
@@ -465,9 +439,8 @@ class SpotWrapper:
                 self._estop_client = self._robot.ensure_client(EstopClient.default_service_name)
                 self._docking_client = self._robot.ensure_client(DockingClient.default_service_name)
                 self._spot_check_client = self._robot.ensure_client(SpotCheckClient.default_service_name)
-                self._mission_client = self._robot.ensure_client(MissionClient.default_service_name)
                 self._license_client = self._robot.ensure_client(LicenseClient.default_service_name)
-                if not self.gripperless and self._robot.has_arm():
+                if self._robot.has_arm():
                     self._gripper_cam_param_client = self._robot.ensure_client(
                         GripperCameraParamClient.default_service_name
                     )
@@ -546,15 +519,6 @@ class SpotWrapper:
             self._logger,
             self._state,
             self._spot_check_client,
-            self._robot_command_client,
-            self._lease_client,
-        )
-
-        self._spot_mission = SpotMission(
-            self._robot,
-            self._logger,
-            self._state,
-            self._mission_client,
             self._robot_command_client,
             self._lease_client,
         )
@@ -763,11 +727,6 @@ class SpotWrapper:
     def spot_check(self) -> SpotCheck:
         """Return SpotCheck instance"""
         return self._spot_check
-
-    @property
-    def spot_mission(self) -> SpotMission:
-        """Return SpotMission instance"""
-        return self._spot_mission
 
     @property
     def spot_eap_lidar(self) -> typing.Optional[SpotEAP]:
@@ -1159,21 +1118,6 @@ class SpotWrapper:
         self.last_sit_command = response[2]
         return response[0], response[1]
 
-    def sit_blocking(self) -> typing.Tuple[bool, str]:
-        """
-        Stop the robot's motion and sit down if able, and block until this function returns.
-
-        Returns:
-            Tuple of bool success and a string message
-
-        """
-        try:
-            blocking_sit(command_client=self._robot_command_client, timeout_sec=10, update_frequency=1.0)
-            return True, "Success"
-        except Exception as e:
-            self._logger.error(f"Unable to execute blocking sit: {e}")
-            return False, str(e)
-
     def simple_stand(self, monitor_command: bool = True) -> typing.Tuple[bool, str]:
         """
         If the e-stop is enabled, and the motor power is enabled, stand the robot up.
@@ -1520,6 +1464,18 @@ class SpotWrapper:
             return self._spot_dance.list_all_dances()
         else:
             return False, "Spot is not licensed for choreography", []
+
+    # NEWER SERVICE DEFINITION #3
+    def capture_image(self, source, image_save_path) -> typing.Tuple[bool, str]:
+        # if source == 'all':
+        #     self._source_list = ['back_fisheye_image', 'frontleft_fisheye_image', 'frontright_fisheye_image', 
+        #                         'hand_color_image', 'left_fisheye_image', 'right_fisheye_image']
+        # else:
+        image_response = self._image_client.get_image_from_sources([source])
+        image = Image.open(io.BytesIO(image_response[0].shot.image.data))
+        image.save(image_save_path + ".jpg")
+        return True, "Image capture success"
+
 
     def get_choreography_status(
         self,
